@@ -124,6 +124,8 @@ class UserEntry:
     code_format = attr.ib(type=str, default="")
     code_length = attr.ib(type=int, default=0)
     area_limit = attr.ib(type=list, default=[])
+    can_manage_users = attr.ib(type=bool, default=False)
+    ha_user_id = attr.ib(type=str, default=None)
 
 
 @attr.s(slots=True, frozen=True)
@@ -601,6 +603,8 @@ class AlarmoStorage:
     def async_create_user(self, data: dict) -> UserEntry:
         """Create a new UserEntry."""
         user_id = str(int(time.time()))
+        while user_id in self.users:
+            user_id = str(int(user_id) + 1)
         new_user = UserEntry(**data, user_id=user_id)
         self.users[user_id] = new_user
         self.async_schedule_save()

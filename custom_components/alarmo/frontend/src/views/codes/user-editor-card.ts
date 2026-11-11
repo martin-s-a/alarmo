@@ -7,6 +7,10 @@ import { fetchUsers, saveUser, deleteUser, fetchAreas } from '../../data/websock
 import { localize } from '../../../localize/localize';
 import { omit, showErrorDialog, handleError, sortAlphabetically, navigate } from '../../helpers';
 import { exportPath } from '../../common/navigation';
+import { Option } from '../../components/alarmo-select';
+import '../../components/alarmo-select';
+
+type HomeAssistantUser = { id: string; name: string; system_generated: boolean; is_active: boolean };
 
 @customElement('user-editor-card')
 export class UserEditorCard extends LitElement {
@@ -31,8 +35,14 @@ export class UserEditorCard extends LitElement {
 
   users?: Dictionary<AlarmoUser>;
   areas: Dictionary<AlarmoArea> = {};
+  accounts: Option[] = [];
 
   async firstUpdated() {
+    const accounts: HomeAssistantUser[] = await this.hass.callWS({ type: 'config/auth/list' });
+    this.accounts = accounts
+      .filter(e => !e.system_generated && e.is_active)
+      .map(e => ({ value: e.id, name: e.name }))
+      .sort(sortAlphabetically);
     this.users = await fetchUsers(this.hass);
     this.areas = await fetchAreas(this.hass);
 
@@ -220,6 +230,47 @@ export class UserEditorCard extends LitElement {
             ?checked=${this.data.is_override_code}
             @change=${(ev: Event) =>
         (this.data = { ...this.data!, is_override_code: (ev.target as HTMLInputElement).checked })}
+          ></ha-switch>
+        </alarmo-settings-row>
+
+        <alarmo-settings-row .narrow=${this.narrow}>
+          <span slot="heading">
+            ${localize('panels.codes.cards.new_user.fields.ha_user.heading', this.hass.language)}
+          </span>
+          <span slot="description">
+            ${localize('panels.codes.cards.new_user.fields.ha_user.description', this.hass.language)}
+          </span>
+
+          <alarmo-select
+            .hass=${this.hass}
+            .items=${this.accounts}
+            .value=${this.data.ha_user_id || ''}
+            label="${localize('panels.codes.cards.new_user.fields.ha_user.heading', this.hass.language)}"
+            clearable
+            @value-changed=${(ev: CustomEvent) => {
+        const account = ev.detail.value || null;
+        this.data = {
+          ...this.data!,
+          ha_user_id: account,
+          can_manage_users: account ? this.data.can_manage_users : false,
+        };
+      }}
+          ></alarmo-select>
+        </alarmo-settings-row>
+
+        <alarmo-settings-row .narrow=${this.narrow}>
+          <span slot="heading">
+            ${localize('panels.codes.cards.new_user.fields.can_manage_users.heading', this.hass.language)}
+          </span>
+          <span slot="description">
+            ${localize('panels.codes.cards.new_user.fields.can_manage_users.description', this.hass.language)}
+          </span>
+
+          <ha-switch
+            ?checked=${this.data.can_manage_users}
+            ?disabled=${!this.data.ha_user_id}
+            @change=${(ev: Event) =>
+        (this.data = { ...this.data!, can_manage_users: (ev.target as HTMLInputElement).checked })}
           ></ha-switch>
         </alarmo-settings-row>
 

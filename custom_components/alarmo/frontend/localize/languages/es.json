@@ -382,6 +382,14 @@
               "heading": "Es un código de anulación",
               "description": "Al ingresar este código se forzará el armado de la alarma."
             },
+            "ha_user": {
+              "heading": "Usuario de Home Assistant",
+              "description": "Con la sesión de este usuario puede cambiar su propio código."
+            },
+            "can_manage_users": {
+              "heading": "Gestiona usuarios",
+              "description": "Con su sesión puede añadir, cambiar y eliminar usuarios, confirmando con su código."
+            },
             "area_limit": {
               "heading": "Áreas restringidas",
               "description": "Limitar al usuario a controlar solo las áreas seleccionadas"

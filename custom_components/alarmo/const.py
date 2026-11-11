@@ -119,6 +119,8 @@ ATTR_IGNORE_BLOCKING_SENSORS_AFTER_TRIGGER = "ignore_blocking_sensors_after_trig
 
 ATTR_REMOVE = "remove"
 ATTR_IS_OVERRIDE_CODE = "is_override_code"
+ATTR_CAN_MANAGE_USERS = "can_manage_users"
+ATTR_HA_USER_ID = "ha_user_id"
 ATTR_AREA_LIMIT = "area_limit"
 ATTR_CODE_FORMAT = "code_format"
 ATTR_CODE_LENGTH = "code_length"

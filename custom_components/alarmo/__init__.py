@@ -298,6 +298,25 @@ class AlarmoCoordinator(DataUpdateCoordinator):
                 return "User with same name already exists"
         return
 
+    async def _validate_user_account(self, user_id: str, data: dict):
+        user = self.store.async_get_user(user_id) or {}
+        account = data.get(const.ATTR_HA_USER_ID, user.get(const.ATTR_HA_USER_ID))
+        if data.get(const.ATTR_HA_USER_ID):
+            ha_user = await self.hass.auth.async_get_user(account)
+            if not ha_user or ha_user.system_generated:
+                return "Home Assistant user not found"
+            for other in self.store.async_get_users().values():
+                if (
+                    other[const.ATTR_HA_USER_ID] == account
+                    and other[const.ATTR_USER_ID] != user_id
+                ):
+                    return "Home Assistant user already linked to another user"
+        if not account and data.get(
+            const.ATTR_CAN_MANAGE_USERS, user.get(const.ATTR_CAN_MANAGE_USERS)
+        ):
+            return "A user who manages users needs a Home Assistant user"
+        return
+
     async def async_update_user_config(
         self, user_id: str | None = None, data: dict = {}
     ):
@@ -316,23 +335,15 @@ class AlarmoCoordinator(DataUpdateCoordinator):
             if err:
                 _LOGGER.error(err)
                 return err
+        if const.ATTR_HA_USER_ID in data:
+            data[const.ATTR_HA_USER_ID] = data[const.ATTR_HA_USER_ID] or None
+        err = await self._validate_user_account(user_id, data)
+        if err:
+            _LOGGER.error(err)
+            return err
 
         if data.get(ATTR_CODE):
-            data[const.ATTR_CODE_FORMAT] = (
-                "number" if data[ATTR_CODE].isdigit() else "text"
-            )
-            data[const.ATTR_CODE_LENGTH] = len(data[ATTR_CODE])
-
-            def _hash_code(code):
-                hashed = bcrypt.hashpw(
-                    code.encode("utf-8"),
-                    bcrypt.gensalt(rounds=BCRYPT_NUM_ROUNDS),
-                )
-                return base64.b64encode(hashed).decode()
-
-            data[ATTR_CODE] = await self.hass.async_add_executor_job(
-                _hash_code, data[ATTR_CODE]
-            )
+            data.update(await self.async_hash_code(data[ATTR_CODE]))
 
         if not user_id:
             self.store.async_create_user(data)
@@ -342,6 +353,22 @@ class AlarmoCoordinator(DataUpdateCoordinator):
                 del data[const.ATTR_OLD_CODE]
             self.store.async_update_user(user_id, data)
             return
+
+    async def async_hash_code(self, code: str) -> dict:
+        """Return the user fields that store a code: its hash, format and length."""
+
+        def _hash_code(code):
+            hashed = bcrypt.hashpw(
+                code.encode("utf-8"),
+                bcrypt.gensalt(rounds=BCRYPT_NUM_ROUNDS),
+            )
+            return base64.b64encode(hashed).decode()
+
+        return {
+            ATTR_CODE: await self.hass.async_add_executor_job(_hash_code, code),
+            const.ATTR_CODE_FORMAT: "number" if code.isdigit() else "text",
+            const.ATTR_CODE_LENGTH: len(code),
+        }
 
     async def async_authenticate_user(self, code, user_id=None):
         """Run user authentication in the executor.

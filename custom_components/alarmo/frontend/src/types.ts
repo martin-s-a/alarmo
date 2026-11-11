@@ -126,6 +126,8 @@ export type AlarmoUser = {
   can_arm: boolean;
   can_disarm: boolean;
   is_override_code: boolean;
+  can_manage_users?: boolean;
+  ha_user_id?: string | null;
   area_limit: string[];
   code_format?: string;
   code_length?: number;

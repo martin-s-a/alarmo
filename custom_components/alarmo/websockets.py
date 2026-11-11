@@ -1,5 +1,10 @@
 """WebSocket handler and registration for Alarmo configuration management."""
 
+import time
+import asyncio
+import logging
+import collections
+
 import voluptuous as vol
 import homeassistant.util.dt as dt_util
 from homeassistant.core import callback
@@ -27,6 +32,7 @@ from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
 )
 from homeassistant.components.websocket_api import decorators, async_register_command
+from homeassistant.components.http.decorators import require_admin
 from homeassistant.components.alarm_control_panel import (
     ATTR_CODE_ARM_REQUIRED,
     CodeFormat,
@@ -90,6 +96,7 @@ class AlarmoConfigView(HomeAssistantView):
     url = "/api/alarmo/config"
     name = "api:alarmo:config"
 
+    @require_admin
     @RequestDataValidator(
         vol.Schema(
             {
@@ -175,6 +182,7 @@ class AlarmoAreaView(HomeAssistantView):
         }
     )
 
+    @require_admin
     @RequestDataValidator(
         vol.Schema(
             {
@@ -213,6 +221,7 @@ class AlarmoSensorView(HomeAssistantView):
     url = "/api/alarmo/sensors"
     name = "api:alarmo:sensors"
 
+    @require_admin
     @RequestDataValidator(
         vol.Schema(
             {
@@ -258,6 +267,7 @@ class AlarmoUserView(HomeAssistantView):
     url = "/api/alarmo/users"
     name = "api:alarmo:users"
 
+    @require_admin
     @RequestDataValidator(
         vol.Schema(
             {
@@ -270,6 +280,8 @@ class AlarmoUserView(HomeAssistantView):
                 vol.Optional(const.ATTR_CAN_ARM): cv.boolean,
                 vol.Optional(const.ATTR_CAN_DISARM): cv.boolean,
                 vol.Optional(const.ATTR_IS_OVERRIDE_CODE): cv.boolean,
+                vol.Optional(const.ATTR_CAN_MANAGE_USERS): cv.boolean,
+                vol.Optional(const.ATTR_HA_USER_ID): vol.Any(None, cv.string),
                 vol.Optional(const.ATTR_AREA_LIMIT): vol.All(
                     cv.ensure_list, [cv.string]
                 ),
@@ -295,6 +307,7 @@ class AlarmoAutomationView(HomeAssistantView):
     url = "/api/alarmo/automations"
     name = "api:alarmo:automations"
 
+    @require_admin
     @RequestDataValidator(
         vol.Schema(
             {
@@ -362,6 +375,7 @@ class AlarmoSensorGroupView(HomeAssistantView):
     url = "/api/alarmo/sensor_groups"
     name = "api:alarmo:sensor_groups"
 
+    @require_admin
     @RequestDataValidator(
         vol.Schema(
             {
@@ -398,6 +412,7 @@ def websocket_get_config(hass, connection, msg):
 
 
 @callback
+@websocket_api.require_admin
 def websocket_get_areas(hass, connection, msg):
     """Publish area data."""
     coordinator = hass.data[const.DOMAIN]["coordinator"]
@@ -406,6 +421,7 @@ def websocket_get_areas(hass, connection, msg):
 
 
 @callback
+@websocket_api.require_admin
 def websocket_get_sensors(hass, connection, msg):
     """Publish sensor data."""
     coordinator = hass.data[const.DOMAIN]["coordinator"]
@@ -417,6 +433,7 @@ def websocket_get_sensors(hass, connection, msg):
 
 
 @callback
+@websocket_api.require_admin
 def websocket_get_users(hass, connection, msg):
     """Publish user data."""
     coordinator = hass.data[const.DOMAIN]["coordinator"]
@@ -425,6 +442,7 @@ def websocket_get_users(hass, connection, msg):
 
 
 @callback
+@websocket_api.require_admin
 def websocket_get_automations(hass, connection, msg):
     """Publish automations data."""
     coordinator = hass.data[const.DOMAIN]["coordinator"]
@@ -447,6 +465,7 @@ def websocket_get_alarm_entities(hass, connection, msg):
 
 
 @callback
+@websocket_api.require_admin
 def websocket_get_sensor_groups(hass, connection, msg):
     """Publish sensor_group data."""
     coordinator = hass.data[const.DOMAIN]["coordinator"]
@@ -505,6 +524,343 @@ def websocket_get_ready_to_arm_modes(hass, connection, msg):
     connection.send_result(msg["id"], data)
 
 
+_LOGGER = logging.getLogger(__name__)
+
+NEW_CODE = vol.All(cv.string, vol.Length(min=4))
+FREE_FAILURES = 3
+LONGEST_WAIT = 60
+NEW_CODES_PER_DAY = 20
+DAY = 24 * 3600
+CODE_ERRORS = {
+    "User with same code already exists": "code_in_use",
+    "User with same name already exists": "name_in_use",
+    "Home Assistant user not found": "account_not_found",
+    "Home Assistant user already linked to another user": "account_in_use",
+    "A user who manages users needs a Home Assistant user": "needs_account",
+}
+
+
+def _now():
+    return time.monotonic()
+
+
+class CodeGuard:
+    """Slow down guessing codes: one check at a time, and longer waits after misses."""
+
+    def __init__(self):
+        """Start with no wrong code."""
+        self.failures = 0
+        self.not_before = 0.0
+        self.new_codes = collections.deque()
+        self.lock = asyncio.Lock()
+
+    def allows(self):
+        """Whether a code may be checked now."""
+        return _now() >= self.not_before
+
+    def failed(self):
+        """Count a wrong code; from the third, wait 1, 2, 4... seconds, up to 60."""
+        self.failures += 1
+        if self.failures >= FREE_FAILURES:
+            wait = min(2 ** (self.failures - FREE_FAILURES), LONGEST_WAIT)
+            self.not_before = _now() + wait
+        _LOGGER.warning("Wrong alarm code given %s times in a row", self.failures)
+
+    def takes_new_code(self):
+        """Count a new code tried, taken or not; refuse past the day's limit."""
+        now = _now()
+        while self.new_codes and self.new_codes[0] <= now - DAY:
+            self.new_codes.popleft()
+        if len(self.new_codes) >= NEW_CODES_PER_DAY:
+            _LOGGER.warning("Too many new alarm codes tried in a day")
+            return False
+        self.new_codes.append(now)
+        return True
+
+    def passed(self):
+        """Forget the wrong codes before a right one."""
+        self.failures = 0
+        self.not_before = 0.0
+
+
+def _guard(hass, connection):
+    """Return the guard the code checks of this Home Assistant user go through."""
+    guards = hass.data[const.DOMAIN].setdefault("code_guards", {})
+    return guards.setdefault(connection.user.id, CodeGuard())
+
+
+def _held_back(connection, msg, guard):
+    """Answer that codes cannot be checked yet, when they cannot."""
+    if guard.allows():
+        return False
+    connection.send_error(
+        msg["id"], "too_many_attempts", "Too many wrong codes, try later"
+    )
+    return True
+
+
+def _spent_new_codes(connection, msg, guard):
+    """Answer that no more new codes can be tried today, when they cannot."""
+    if guard.takes_new_code():
+        return False
+    connection.send_error(
+        msg["id"], "too_many_new_codes", "Too many new codes tried, try later"
+    )
+    return True
+
+
+def _linked_user(coordinator, connection):
+    """Return the enabled user linked to this Home Assistant user, if any."""
+    for user in coordinator.store.async_get_users().values():
+        if (
+            user[const.ATTR_HA_USER_ID] == connection.user.id
+            and user[const.ATTR_ENABLED]
+        ):
+            return user
+    return None
+
+
+def _managers(coordinator):
+    """Return the ids of the users who can manage users from a session."""
+    return [
+        user[const.ATTR_USER_ID]
+        for user in coordinator.store.async_get_users().values()
+        if user[const.ATTR_CAN_MANAGE_USERS]
+        and user[const.ATTR_HA_USER_ID]
+        and user[const.ATTR_ENABLED]
+        and user[ATTR_CODE]
+    ]
+
+
+async def _async_people(hass, coordinator):
+    """Return the users and the accounts they can be linked to, never a code."""
+    accounts = [
+        {"id": account.id, ATTR_NAME: account.name}
+        for account in await hass.auth.async_get_users()
+        if not account.system_generated and account.is_active
+    ]
+    users = [
+        {
+            const.ATTR_USER_ID: user[const.ATTR_USER_ID],
+            ATTR_NAME: user[ATTR_NAME],
+            const.ATTR_ENABLED: user[const.ATTR_ENABLED],
+            const.ATTR_CAN_MANAGE_USERS: user[const.ATTR_CAN_MANAGE_USERS],
+            const.ATTR_HA_USER_ID: user[const.ATTR_HA_USER_ID],
+        }
+        for user in coordinator.store.async_get_users().values()
+    ]
+    return {"users": users, "accounts": accounts}
+
+
+@decorators.websocket_command({vol.Required("type"): "alarmo/my_user"})
+@callback
+def websocket_get_my_user(hass, connection, msg):
+    """Publish the user linked to this Home Assistant user, or None."""
+    user = _linked_user(hass.data[const.DOMAIN]["coordinator"], connection)
+    connection.send_result(
+        msg["id"],
+        user
+        and {
+            const.ATTR_USER_ID: user[const.ATTR_USER_ID],
+            ATTR_NAME: user[ATTR_NAME],
+            const.ATTR_CAN_MANAGE_USERS: user[const.ATTR_CAN_MANAGE_USERS],
+        },
+    )
+
+
+async def _async_code_in_use(coordinator, code, user_id):
+    """Whether the code belongs to another user than this one."""
+    owner = await coordinator.async_authenticate_user(code)
+    return bool(owner) and owner[const.ATTR_USER_ID] != user_id
+
+
+@decorators.websocket_command(
+    {
+        vol.Required("type"): "alarmo/change_own_code",
+        vol.Required(const.ATTR_OLD_CODE): vol.All(cv.string, vol.Length(min=1)),
+        vol.Required(ATTR_CODE): NEW_CODE,
+    }
+)
+@decorators.async_response
+async def websocket_change_own_code(hass, connection, msg):
+    """Change the code of the user linked to this Home Assistant user."""
+    coordinator = hass.data[const.DOMAIN]["coordinator"]
+    user = _linked_user(coordinator, connection)
+    if not user:
+        connection.send_error(
+            msg["id"], "not_linked", "No user is linked to this account"
+        )
+        return
+    user_id = user[const.ATTR_USER_ID]
+    guard = _guard(hass, connection)
+    # Held across the check, so codes sent together are counted one by one.
+    async with guard.lock:
+        if _held_back(connection, msg, guard):
+            return
+        if not await coordinator.async_authenticate_user(
+            msg[const.ATTR_OLD_CODE], user_id
+        ):
+            guard.failed()
+            connection.send_error(msg["id"], "wrong_code", "Wrong code provided")
+            return
+        if _spent_new_codes(connection, msg, guard):
+            return
+        # Someone else's code, as a guess at it would be.
+        if await _async_code_in_use(coordinator, msg[ATTR_CODE], user_id):
+            guard.failed()
+            connection.send_error(
+                msg["id"], "code_in_use", "User with same code already exists"
+            )
+            return
+        guard.passed()
+        coordinator.store.async_update_user(
+            user_id, await coordinator.async_hash_code(msg[ATTR_CODE])
+        )
+    async_dispatcher_send(hass, "alarmo_update_frontend")
+    connection.send_result(msg["id"])
+
+
+def _manager(hass, connection, msg):
+    """Return the linked user if they manage users; when not, say so."""
+    user = _linked_user(hass.data[const.DOMAIN]["coordinator"], connection)
+    if not user or not user[const.ATTR_CAN_MANAGE_USERS]:
+        connection.send_error(
+            msg["id"], "not_manager", "This account does not manage users"
+        )
+        return None
+    return user
+
+
+@decorators.websocket_command({vol.Required("type"): "alarmo/people"})
+@decorators.async_response
+async def websocket_get_people(hass, connection, msg):
+    """Publish the users to a Home Assistant user who manages them."""
+    if _manager(hass, connection, msg):
+        coordinator = hass.data[const.DOMAIN]["coordinator"]
+        connection.send_result(msg["id"], await _async_people(hass, coordinator))
+
+
+def _leaves_no_manager(coordinator, user_id):
+    """Whether this user is the only one who manages users."""
+    return _managers(coordinator) == [user_id]
+
+
+async def _async_add_person(coordinator, msg):
+    if ATTR_NAME not in msg or "new_code" not in msg:
+        return "invalid_format", "A name and a code are needed"
+    data = {
+        ATTR_NAME: msg[ATTR_NAME],
+        ATTR_CODE: msg["new_code"],
+        const.ATTR_CAN_ARM: True,
+        const.ATTR_CAN_DISARM: True,
+    }
+    if msg.get(const.ATTR_HA_USER_ID):
+        data[const.ATTR_HA_USER_ID] = msg[const.ATTR_HA_USER_ID]
+    err = await coordinator.async_update_user_config(None, data)
+    return (CODE_ERRORS.get(err, "invalid"), err) if err else None
+
+
+async def _async_set_code(coordinator, msg):
+    if "new_code" not in msg:
+        return "invalid_format", "A code is needed"
+    if await _async_code_in_use(coordinator, msg["new_code"], msg[const.ATTR_USER_ID]):
+        return "code_in_use", "User with same code already exists"
+    coordinator.store.async_update_user(
+        msg[const.ATTR_USER_ID], await coordinator.async_hash_code(msg["new_code"])
+    )
+    return None
+
+
+async def _async_set_manager(coordinator, msg):
+    if const.ATTR_CAN_MANAGE_USERS not in msg:
+        return "invalid_format", "Whether they manage users is needed"
+    manages = msg[const.ATTR_CAN_MANAGE_USERS]
+    if not manages and _leaves_no_manager(coordinator, msg[const.ATTR_USER_ID]):
+        return "last_manager", "Someone has to manage users"
+    err = await coordinator.async_update_user_config(
+        msg[const.ATTR_USER_ID], {const.ATTR_CAN_MANAGE_USERS: manages}
+    )
+    return (CODE_ERRORS.get(err, "invalid"), err) if err else None
+
+
+async def _async_link(coordinator, msg):
+    if const.ATTR_HA_USER_ID not in msg:
+        return "invalid_format", "A Home Assistant user, or none, is needed"
+    account = msg[const.ATTR_HA_USER_ID]
+    if not account and _leaves_no_manager(coordinator, msg[const.ATTR_USER_ID]):
+        return "last_manager", "Someone has to manage users"
+    changes = {const.ATTR_HA_USER_ID: account}
+    if not account:
+        changes[const.ATTR_CAN_MANAGE_USERS] = False
+    err = await coordinator.async_update_user_config(msg[const.ATTR_USER_ID], changes)
+    return (CODE_ERRORS.get(err, "invalid"), err) if err else None
+
+
+async def _async_remove_person(coordinator, msg):
+    if _leaves_no_manager(coordinator, msg[const.ATTR_USER_ID]):
+        return "last_manager", "Someone has to manage users"
+    coordinator.store.async_delete_user(msg[const.ATTR_USER_ID])
+    return None
+
+
+PEOPLE_ACTIONS = {
+    "add": _async_add_person,
+    "set_code": _async_set_code,
+    "set_manager": _async_set_manager,
+    "link": _async_link,
+    "remove": _async_remove_person,
+}
+CODE_ACTION_ERRORS = ("code_in_use",)
+
+
+@decorators.websocket_command(
+    {
+        vol.Required("type"): "alarmo/manage_people",
+        vol.Required(ATTR_CODE): vol.All(cv.string, vol.Length(min=1)),
+        vol.Required("action"): vol.In(list(PEOPLE_ACTIONS)),
+        vol.Optional(const.ATTR_USER_ID): cv.string,
+        vol.Optional(ATTR_NAME): vol.All(cv.string, vol.Strip, vol.Length(min=1)),
+        vol.Optional("new_code"): NEW_CODE,
+        vol.Optional(const.ATTR_CAN_MANAGE_USERS): cv.boolean,
+        vol.Optional(const.ATTR_HA_USER_ID): vol.Any(None, cv.string),
+    }
+)
+@decorators.async_response
+async def websocket_manage_people(hass, connection, msg):
+    """Add, change or remove a user, for a manager who confirms with their code."""
+    manager = _manager(hass, connection, msg)
+    if not manager:
+        return
+    coordinator = hass.data[const.DOMAIN]["coordinator"]
+    if msg["action"] != "add" and not coordinator.store.async_get_user(
+        msg.get(const.ATTR_USER_ID)
+    ):
+        connection.send_error(msg["id"], "not_found", "No such user")
+        return
+    guard = _guard(hass, connection)
+    async with guard.lock:
+        if _held_back(connection, msg, guard):
+            return
+        if not await coordinator.async_authenticate_user(
+            msg[ATTR_CODE], manager[const.ATTR_USER_ID]
+        ):
+            guard.failed()
+            connection.send_error(msg["id"], "wrong_code", "Wrong code provided")
+            return
+        if "new_code" in msg and _spent_new_codes(connection, msg, guard):
+            return
+        err = await PEOPLE_ACTIONS[msg["action"]](coordinator, msg)
+        if err and err[0] in CODE_ACTION_ERRORS:
+            guard.failed()
+        else:
+            guard.passed()
+    if err:
+        connection.send_error(msg["id"], *err)
+        return
+    async_dispatcher_send(hass, "alarmo_update_frontend")
+    connection.send_result(msg["id"], await _async_people(hass, coordinator))
+
+
 async def async_register_websockets(hass):
     """Register websocket handlers."""
     hass.http.register_view(AlarmoConfigView)
@@ -515,6 +871,10 @@ async def async_register_websockets(hass):
     hass.http.register_view(AlarmoSensorGroupView)
 
     async_register_command(hass, handle_subscribe_updates)
+    async_register_command(hass, websocket_get_my_user)
+    async_register_command(hass, websocket_change_own_code)
+    async_register_command(hass, websocket_get_people)
+    async_register_command(hass, websocket_manage_people)
 
     async_register_command(
         hass,

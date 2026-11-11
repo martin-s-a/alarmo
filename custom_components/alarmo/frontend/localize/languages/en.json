@@ -382,6 +382,14 @@
               "heading": "Is override code",
               "description": "Entering this code will arm the alarm in force"
             },
+            "ha_user": {
+              "heading": "Home Assistant user",
+              "description": "Logged in as this user, they can change their own code"
+            },
+            "can_manage_users": {
+              "heading": "Manages users",
+              "description": "Logged in, they can add, change and remove users, confirming with their code"
+            },
             "area_limit": {
               "heading": "Restricted areas",
               "description": "Limit user to control only the selected areas"

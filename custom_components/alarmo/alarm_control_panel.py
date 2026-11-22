@@ -551,7 +551,7 @@ class AlarmoBaseEntity(AlarmControlPanelEntity, RestoreEntity):
         code = kwargs.get(const.CONF_CODE, "")
         skip_code = kwargs.get("skip_code", False)
         skip_delay = kwargs.get(const.ATTR_SKIP_DELAY, False)
-        bypass_open_sensors = kwargs.get("bypass_open_sensors", False)
+        bypass_open_sensors = bool(kwargs.get("bypass_open_sensors", False))
         context_id = kwargs.get("context_id", None)
 
         if (
@@ -912,6 +912,10 @@ class AlarmoAreaEntity(AlarmoBaseEntity):
         self._open_sensors = open_sensors
         command = self._arm_mode.replace("armed", "arm")
 
+        if self._state == AlarmControlPanelState.ARMING and not self._revert_state:
+            # arming resumed after a restart does not know its prior state
+            self._revert_state = AlarmControlPanelState.DISARMED
+
         if self._state != self._revert_state and self._revert_state:
             self.async_update_state(self._revert_state)
         else:
@@ -972,6 +976,8 @@ class AlarmoAreaEntity(AlarmoBaseEntity):
                 # proceed the arm
                 if bypassed_sensors:
                     self.bypassed_sensors = bypassed_sensors
+                # force does not outlive the arming it was requested for
+                self._bypass_open_sensors = False
                 self.open_sensors = open_sensors if open_sensors else None
                 if self.changed_by:
                     _LOGGER.info(
@@ -1022,6 +1028,12 @@ class AlarmoAreaEntity(AlarmoBaseEntity):
                     "Alarm is now arming. Waiting for %s seconds.",
                     exit_delay,
                 )
+
+                if self._bypass_open_sensors:
+                    # force covers only the sensors not ready at the request
+                    self._bypass_open_sensors = self.hass.data[const.DOMAIN][
+                        "sensor_handler"
+                    ].sensors_to_force_bypass(self.area_id, arm_mode)
 
                 @callback
                 def async_leave_timer_finished(now):

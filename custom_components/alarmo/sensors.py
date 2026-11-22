@@ -301,7 +301,11 @@ class SensorHandler:
     def validate_arming_event(
         self, area_id: str, target_state: str | None = None, **kwargs
     ):
-        """Check whether all sensors have the correct state prior to arming."""
+        """Check whether all sensors have the correct state prior to arming.
+
+        bypass_open_sensors is True to bypass any sensor that is not ready,
+        or a list to bypass only the sensors in it.
+        """
         use_delay = kwargs.get("use_delay", False)
         bypass_open_sensors = kwargs.get("bypass_open_sensors", False)
 
@@ -327,19 +331,44 @@ class SensorHandler:
 
             if not res and target_state in const.ARM_MODES:
                 # sensor is active while arming
-                if bypass_open_sensors or (
+                forced = (
+                    entity in bypass_open_sensors
+                    if isinstance(bypass_open_sensors, list)
+                    else bypass_open_sensors
+                )
+                if sensor_config[ATTR_ALLOW_OPEN] and sensor_state == STATE_OPEN:
+                    # sensor is permitted to be open during/after arming
+                    continue
+                elif forced or (
                     sensor_config[ATTR_AUTO_BYPASS]
                     and target_state in sensor_config[ATTR_AUTO_BYPASS_MODES]
                 ):
                     # sensor may be bypassed
                     bypassed_sensors.append(entity)
-                elif sensor_config[ATTR_ALLOW_OPEN] and sensor_state == STATE_OPEN:
-                    # sensor is permitted to be open during/after arming
-                    continue
                 else:
                     open_sensors[entity] = sensor_state
 
         return (open_sensors, bypassed_sensors)
+
+    def sensors_to_force_bypass(self, area_id: str, target_state: str):
+        """List the sensors force bypasses when arming with an exit delay.
+
+        These are the sensors not ready for target_state now, except a motion
+        sensor that is only detecting and may do so during the exit delay.
+        """
+        (_open_sensors, blocking_now) = self.validate_arming_event(
+            area_id, target_state, use_delay=True, bypass_open_sensors=True
+        )
+        (_open_sensors, not_ready) = self.validate_arming_event(
+            area_id, target_state, bypass_open_sensors=True
+        )
+        return [
+            entity
+            for entity in not_ready
+            if entity in blocking_now
+            or self._config[entity]["type"] != SENSOR_TYPE_MOTION
+            or parse_sensor_state(self.hass.states.get(entity)) != STATE_OPEN
+        ]
 
     def get_entry_delay_for_trigger(
         self, open_sensors: dict[str, str], area_id: str, arm_mode: str

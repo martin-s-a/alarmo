@@ -54,6 +54,23 @@ OR to run a single test in a file:
 | `test_auto_bypass_multiple_modes` | Auto bypass with multiple modes |
 | `test_auto_bypass_empty_modes` | Auto bypass with empty modes list |
 
+### **Force Arming** (`test_force_arming.py`)
+
+| Test Function | Feature Tested |
+|---------------|----------------|
+| `test_force_bypasses_door_open_at_request_until_disarm` | Force bypasses a door open at the request until disarm |
+| `test_force_watches_door_open_at_request_and_closed_at_end` | A door open at the request but closed at the end of the exit delay is watched |
+| `test_force_does_not_bypass_allow_open_motion` | Force never bypasses an open allow_open motion sensor: ignored until it clears, then triggers |
+| `test_force_fails_when_sensor_ready_at_request_is_not_at_end` | A sensor ready at the request but not at the end of the exit delay fails arming, as without force |
+| `test_restart_while_arming_ends_as_without_force` | A restart during the exit delay ends it as without force: a still-open door fails arming, back to disarmed |
+| `test_restart_while_arming_still_needs_the_code_to_disarm` | An arming restored after a restart still needs the code to disarm |
+| `test_restart_while_armed_keeps_door_bypassed_by_force` | A door bypassed by force stays bypassed after a restart while armed |
+| `test_force_does_not_cover_motion_only_detecting_at_request` | Motion detecting at the request but allowed in the exit delay is not forced: watched once clear, fails arming if still detecting |
+| `test_force_covers_motion_blocking_the_request` | Motion without exit delay detecting at the request is bypassed by force |
+| `test_rearm_after_trigger_does_not_force_the_intrusion` | Re-arming after the trigger time does not bypass the sensor that triggered |
+| `test_auto_bypass_still_applies_at_end_of_exit_delay` | auto_bypass bypasses a door opened during the exit delay, force or not |
+| `test_auto_bypass_does_not_bypass_allow_open_motion` | allow_open wins over auto_bypass for an open motion sensor |
+
 ### **Environmental Sensors** (`test_environmental_sensors.py`)
 
 | Test Function | Feature Tested |
